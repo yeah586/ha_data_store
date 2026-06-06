@@ -1000,6 +1000,19 @@
       <label>年数据条数限制</label>
       <input type="number" id="apiEleYearLimit" value="0" min="0" placeholder="0=不限" onchange="generateApiUrl()">
     </div>
+    <div id="apiEleTranslatedFieldRow" style="display:none">
+      <label>translated 字段来源</label>
+      <input type="text" id="apiEleTranslatedField" value="dayEleCost" placeholder="输入字段名，如 dayEleCost/预付费/剩余天数" list="apiEleTranslatedDatalist" oninput="generateApiUrl()">
+      <datalist id="apiEleTranslatedDatalist">
+        <option value="dayEleCost">
+        <option value="预付费">
+        <option value="剩余天数">
+        <option value="日均消费">
+        <option value="dayEleNum">
+        <option value="date">
+        <option value="name">
+      </datalist>
+    </div>
     <div id="apiHealthNameRow" style="display:none">
       <label>姓名</label>
       <select id="apiHealthName" onchange="generateApiUrl()">
@@ -4034,6 +4047,7 @@ function onApiTypeChange() {
   document.getElementById('apiEleDayLimitRow').style.display = isElectricityStandard ? '' : 'none';
   document.getElementById('apiEleMonthLimitRow').style.display = isElectricityStandard ? '' : 'none';
   document.getElementById('apiEleYearLimitRow').style.display = isElectricityStandard ? '' : 'none';
+  document.getElementById('apiEleTranslatedFieldRow').style.display = isElectricityStandard ? '' : 'none';
 
   document.getElementById('apiCategoryRow').style.display = isRoomsDaily ? 'block' : 'none';
   document.getElementById('apiMetricsRow').style.display = isRoomsMultiMetric ? 'block' : 'none';
@@ -4165,6 +4179,7 @@ function onApiTypeChange() {
     document.getElementById('apiEleDayLimitRow').style.display = 'none';
     document.getElementById('apiEleMonthLimitRow').style.display = 'none';
     document.getElementById('apiEleYearLimitRow').style.display = 'none';
+    document.getElementById('apiEleTranslatedFieldRow').style.display = 'none';
     document.getElementById('apiHealthNameRow').style.display = '';
     document.getElementById('apiHealthTypeRow').style.display = isHealthHistory ? '' : 'none';
     document.getElementById('apiLimit').parentNode.style.display = isHealthHistory ? '' : 'none';
@@ -4412,6 +4427,11 @@ function generateApiUrl() {
     if (dayLimit && Number(dayLimit) > 0) url += '&day_limit=' + encodeURIComponent(dayLimit);
     if (monthLimit && Number(monthLimit) > 0) url += '&month_limit=' + encodeURIComponent(monthLimit);
     if (yearLimit && Number(yearLimit) > 0) url += '&year_limit=' + encodeURIComponent(yearLimit);
+    const translatedField = document.getElementById('apiEleTranslatedField').value;
+    if (translatedField !== undefined && translatedField !== 'dayEleCost') {
+      // 非默认值才传递，保持向后兼容
+      url += '&translated_field=' + encodeURIComponent(translatedField);
+    }
     document.getElementById('apiUrlOutput').value = url;
     return;
   }

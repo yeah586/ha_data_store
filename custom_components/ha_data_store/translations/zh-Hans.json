@@ -155,6 +155,9 @@
       },
       "db_edit_access": {
         "name": "数据库修改"
+      },
+      "remote_access": {
+        "name": "远程访问"
       }
     },
     "sensor": {

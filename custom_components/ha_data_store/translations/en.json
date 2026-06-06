@@ -110,6 +110,9 @@
       },
       "db_edit_access": {
         "name": "DB Modification"
+      },
+      "remote_access": {
+        "name": "Remote Access"
       }
     },
     "sensor": {

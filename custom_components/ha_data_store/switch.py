@@ -41,6 +41,14 @@ class HaDataStoreDbViewerSwitch(HaDataStoreMasterSwitch):
     _key = "db_viewer_enabled"; _attr_translation_key = "db_viewer_access"
 class HaDataStoreDbEditSwitch(HaDataStoreMasterSwitch):
     _key = "db_edit_enabled"; _attr_translation_key = "db_edit_access"
+class HaDataStoreRemoteAccessSwitch(HaDataStoreMasterSwitch):
+    _key = "allow_remote_access"; _attr_translation_key = "remote_access"
+    async def async_added_to_hass(self):
+        await super().async_added_to_hass()
+        # 每次启动/重启都强制关闭，不同步历史状态
+        self._attr_is_on = False
+        self._hass.data.setdefault(DOMAIN, {})[self._key] = False
+        self.async_write_ha_state()
 
 
 async def async_setup_entry(hass, entry, async_add_entities):
@@ -55,6 +63,7 @@ async def async_setup_entry(hass, entry, async_add_entities):
         HaDataStoreApiSwitch(hass, device_info),
         HaDataStoreDbViewerSwitch(hass, device_info),
         HaDataStoreDbEditSwitch(hass, device_info),
+        HaDataStoreRemoteAccessSwitch(hass, device_info),
     ]
 
     # 桥接开关

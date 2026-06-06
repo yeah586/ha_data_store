@@ -2933,6 +2933,16 @@ async def _async_state_changed(hass: HomeAssistant, db_path: str, event: Event) 
     pending_json_path = _get_pending_json_path(storage_dir)
 
     if is_on:
+        # ★ 如果旧状态也是 on，说明只是模式/温度/速度等属性变化（非真正开机），忽略
+        if old_state and _is_on_state(entity_id, old_state.state):
+            local_logger = get_logger()
+            if local_logger:
+                local_logger.info(
+                    "[device] 忽略属性变化 entity_id=%s old=%s new=%s (非开关动作)",
+                    entity_id, old_state.state, new_state_val,
+                )
+            return
+
         # 预检测：今日是否有未关闭的旧记录，有则先修正再插入新记录
         today_prefix = now_str[:10]
         def _check_unclosed():
@@ -2968,6 +2978,16 @@ async def _async_state_changed(hass: HomeAssistant, db_path: str, event: Event) 
             if local_logger:
                 local_logger.exception("[device] 写入开机记录异常 entity_id=%s", entity_id)
     elif is_off:
+        # ★ 如果旧状态也是 off，说明只是关闭状态下的属性变化（非真正关机），忽略
+        if old_state and _is_off_state(entity_id, old_state.state):
+            local_logger = get_logger()
+            if local_logger:
+                local_logger.info(
+                    "[device] 忽略关闭态属性变化 entity_id=%s old=%s new=%s (非开关动作)",
+                    entity_id, old_state.state, new_state_val,
+                )
+            return
+
         off_power = _get_power_value()
         local_logger = get_logger()
         if local_logger:
@@ -3400,6 +3420,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.data[DOMAIN].setdefault("api_enabled", True)
     hass.data[DOMAIN].setdefault("db_viewer_enabled", True)
     hass.data[DOMAIN].setdefault("db_edit_enabled", True)
+    hass.data[DOMAIN].setdefault("allow_remote_access", False)
 
     _register_api_views(hass, db_path)
 

@@ -2519,6 +2519,9 @@ class QueryView(_BaseDBView):
         month_table = request.query.get("month_table", "attr_ele_month").strip()
         year_table = request.query.get("year_table", "attr_ele_year").strip()
 
+        # ★ translated 字段来源：默认 dayEleCost，可通过参数指定任意字段
+        translated_field = request.query.get("translated_field", "dayEleCost").strip()
+
         try:
             day_limit = int(request.query.get("day_limit", "0").strip())
         except ValueError:
@@ -2595,7 +2598,7 @@ class QueryView(_BaseDBView):
             billing_source = billing_latest if billing_latest else latest
 
             # ---- 3. 构建 state 和时间戳 ----
-            raw_value = str(latest.get("dayEleCost", ""))
+            raw_value = str(latest.get(translated_field, "")) if translated_field else ""
             updated_at = latest.get("updated_at", "")
             last_changed = updated_at
             last_updated = updated_at
@@ -3307,15 +3310,16 @@ class DBViewerView(_BaseDBView):
         hass: HomeAssistant = request.app["hass"]
         # 总开关
         if not hass.data.get(DOMAIN, {}).get("api_enabled", True):
-            return web.Response(status=403)
+            return web.Response(status=403, content_type="text/html; charset=utf-8")
         if not hass.data.get(DOMAIN, {}).get("db_viewer_enabled", True):
-            return web.Response(status=403)
-        # 同网段检查
-        client_ip = _get_client_ip(request)
-        ha_subnet = _get_ha_subnet(request)
-        client_subnet = client_ip.rsplit(".", 1)[0] if "." in client_ip else ""
-        if not client_subnet or client_subnet != ha_subnet:
-            return web.Response(status=403)
+            return web.Response(status=403, content_type="text/html; charset=utf-8")
+        # 同网段检查（可通过开关放行）
+        if not hass.data.get(DOMAIN, {}).get("allow_remote_access", False):
+            client_ip = _get_client_ip(request)
+            ha_subnet = _get_ha_subnet(request)
+            client_subnet = client_ip.rsplit(".", 1)[0] if "." in client_ip else ""
+            if not client_subnet or client_subnet != ha_subnet:
+                return web.Response(status=403, content_type="text/html; charset=utf-8")
         # 登录检查
         token = request.cookies.get("hds_auth", "")
         if token == _make_auth_token(self._db_path):
