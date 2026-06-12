@@ -20,8 +20,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import random
+import time
+import urllib.parse
 from datetime import timedelta
+from pathlib import Path
 from typing import Any
 
 from homeassistant.components.switch import SwitchEntity
@@ -37,6 +41,9 @@ from homeassistant.components.sensor import SensorEntity
 from homeassistant.components.binary_sensor import BinarySensorEntity
 from homeassistant.components.number import NumberEntity
 from homeassistant.components.select import SelectEntity
+from homeassistant.components.media_player import (
+    MediaPlayerEntity, MediaPlayerEntityFeature, MediaPlayerState,
+)
 
 try:
     from homeassistant.components.vacuum import VacuumEntity
@@ -81,6 +88,61 @@ from .const import DOMAIN
 _LOGGER = logging.getLogger(__name__)
 
 VIRTUAL_DEVICE_DOMAIN = "virtual_device"
+
+
+async def _probe_media_duration(hass: HomeAssistant, media_id: str) -> int | None:
+    """尝试从 media-source:// 媒体 ID 解析本地文件并获取真实时长（秒）。"""
+    if not media_id or not media_id.startswith("media-source://"):
+        return None
+    try:
+        path_part = urllib.parse.unquote(media_id.split("/local/", 1)[-1])
+        if not path_part:
+            _LOGGER.warning("[probe] 无法从 media_id 提取路径: %s", media_id)
+            return None
+
+        # 尝试多个可能的媒体目录
+        candidates = []
+        try:
+            candidates.append(hass.config.path("media"))
+        except Exception:
+            pass
+        try:
+            candidates.append(os.path.join(hass.config.config_dir, "media"))
+        except Exception:
+            pass
+
+        for base in candidates:
+            if not base or not os.path.isdir(base):
+                continue
+            full = Path(base) / path_part
+            _LOGGER.warning("[probe] 尝试路径: %s (exists=%s)", full, full.exists())
+            if full.is_file():
+                try:
+                    from mutagen import File as MFile
+
+                    audio = await hass.async_add_executor_job(MFile, str(full))
+                    if audio is None:
+                        _LOGGER.warning("[probe] mutagen.File 返回 None，格式可能不支持: %s", full)
+                        continue
+                    if audio.info is None:
+                        _LOGGER.warning("[probe] mutagen File.info 为 None: %s", full)
+                        continue
+                    length = getattr(audio.info, "length", None)
+                    if length:
+                        _LOGGER.warning("[probe] 成功读取时长: %s = %ds", full, int(length))
+                        return int(length)
+                    else:
+                        _LOGGER.warning("[probe] audio.info.length 为空: %s", full)
+                except ImportError:
+                    _LOGGER.warning("[probe] mutagen 库未安装，无法探测时长")
+                    return None  # 没安装就没必要继续尝试了
+                except Exception:
+                    _LOGGER.warning("[probe] 读取文件失败: %s", full, exc_info=True)
+            else:
+                _LOGGER.warning("[probe] 文件不存在: %s", full)
+    except Exception:
+        _LOGGER.warning("[probe] 探测过程异常: %s", media_id, exc_info=True)
+    return None
 
 
 # =========================================================================== #
@@ -626,6 +688,594 @@ class VirtualVacuum(VacuumEntity, RestoreEntity):
 
 
 # =========================================================================== #
+#  虚拟媒体播放器（完整功能：播放/暂停/停止/音量/音源/媒体信息）                    #
+# =========================================================================== #
+class VirtualMedia(MediaPlayerEntity, RestoreEntity):
+    """通用媒体虚拟设备 — 模拟家庭影院/电视盒子等媒体播放器。"""
+    _attr_has_entity_name = True
+    _attr_should_poll = False
+    _attr_supported_features = (
+        MediaPlayerEntityFeature.PLAY |
+        MediaPlayerEntityFeature.PAUSE |
+        MediaPlayerEntityFeature.STOP |
+        MediaPlayerEntityFeature.TURN_ON |
+        MediaPlayerEntityFeature.TURN_OFF |
+        MediaPlayerEntityFeature.VOLUME_SET |
+        MediaPlayerEntityFeature.VOLUME_MUTE |
+        MediaPlayerEntityFeature.VOLUME_STEP |
+        MediaPlayerEntityFeature.SELECT_SOURCE |
+        MediaPlayerEntityFeature.NEXT_TRACK |
+        MediaPlayerEntityFeature.PREVIOUS_TRACK |
+        MediaPlayerEntityFeature.PLAY_MEDIA |
+        MediaPlayerEntityFeature.SEEK |
+        MediaPlayerEntityFeature.SHUFFLE_SET |
+        MediaPlayerEntityFeature.REPEAT_SET |
+        MediaPlayerEntityFeature.CLEAR_PLAYLIST |
+        MediaPlayerEntityFeature.SELECT_SOUND_MODE
+    )
+    _attr_source_list = ["HDMI 1", "HDMI 2", "HDMI 3", "TV", "Netflix", "YouTube", "电脑", "游戏机", "蓝牙"]
+    _attr_sound_mode_list = ["标准", "影院", "音乐", "新闻", "运动"]
+
+    def __init__(self, entity_id: str, name: str, device_info: DeviceInfo) -> None:
+        super().__init__()
+        self._attr_unique_id = f"{DOMAIN}_virtual_{entity_id}"
+        self._attr_name = name
+        self._attr_device_info = device_info
+        self._attr_state = MediaPlayerState.OFF
+        self._attr_volume_level = 0.5
+        self._attr_is_volume_muted = False
+        self._attr_source = "HDMI 1"
+        self._attr_sound_mode = "标准"
+        self._attr_media_title = None
+        self._attr_media_artist = None
+        self._attr_media_album_name = None
+        self._attr_media_image_url = None
+        self._attr_media_content_id = None
+        self._attr_media_content_type = None
+        self._attr_media_duration = None
+        self._attr_media_position = None
+        self._attr_media_position_updated_at = None
+        self._attr_shuffle = False
+        self._attr_repeat = "off"
+        self._attr_app_id = None
+        self._attr_app_name = None
+        self.entity_id = entity_id
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        last = await self.async_get_last_state()
+        if last and last.state is not None:
+            try:
+                self._attr_state = MediaPlayerState(last.state)
+            except ValueError:
+                self._attr_state = MediaPlayerState.OFF
+        if last and last.attributes:
+            self._attr_volume_level = last.attributes.get("volume_level", 0.5)
+            self._attr_is_volume_muted = last.attributes.get("is_volume_muted", False)
+            self._attr_source = last.attributes.get("source", "HDMI 1")
+            self._attr_sound_mode = last.attributes.get("sound_mode", "标准")
+            self._attr_media_title = last.attributes.get("media_title")
+            self._attr_media_artist = last.attributes.get("media_artist")
+            self._attr_media_album_name = last.attributes.get("media_album_name")
+            self._attr_media_content_id = last.attributes.get("media_content_id")
+            self._attr_media_duration = last.attributes.get("media_duration")
+            self._attr_media_position = last.attributes.get("media_position")
+            self._attr_shuffle = last.attributes.get("shuffle", False)
+            self._attr_repeat = last.attributes.get("repeat", "off")
+
+    async def async_turn_on(self) -> None:
+        self._attr_state = MediaPlayerState.IDLE
+        self.async_write_ha_state()
+
+    async def async_turn_off(self) -> None:
+        self._attr_state = MediaPlayerState.OFF
+        self.async_write_ha_state()
+
+    async def async_media_play(self) -> None:
+        self._attr_state = MediaPlayerState.PLAYING
+        self._attr_media_position_updated_at = time.time()
+        self.async_write_ha_state()
+
+    async def async_media_pause(self) -> None:
+        self._attr_state = MediaPlayerState.PAUSED
+        self.async_write_ha_state()
+
+    async def async_media_stop(self) -> None:
+        self._attr_state = MediaPlayerState.IDLE
+        self.async_write_ha_state()
+
+    async def async_media_seek(self, position: float) -> None:
+        """拖动进度条到指定位置。"""
+        self._attr_media_position = int(position)
+        self._attr_media_position_updated_at = time.time()
+        self.async_write_ha_state()
+
+    async def async_media_next_track(self) -> None:
+        self._attr_media_position = 0
+        self._attr_media_position_updated_at = None
+        self.async_write_ha_state()
+
+    async def async_media_previous_track(self) -> None:
+        self._attr_media_position = 0
+        self._attr_media_position_updated_at = None
+        self.async_write_ha_state()
+
+    async def async_set_volume_level(self, volume: float) -> None:
+        self._attr_volume_level = max(0.0, min(1.0, volume))
+        self.async_write_ha_state()
+
+    async def async_mute_volume(self, mute: bool) -> None:
+        self._attr_is_volume_muted = mute
+        self.async_write_ha_state()
+
+    async def async_select_source(self, source: str) -> None:
+        if source in (self._attr_source_list or []):
+            self._attr_source = source
+            # 切换音源时模拟媒体信息更新
+            if source in ("Netflix", "YouTube"):
+                sample = {
+                    "Netflix": ("绝命毒师", "Breaking Bad", "TV Shows"),
+                    "YouTube": ("Lofi Music", "Chill Beats", "Lofi Mix"),
+                }.get(source)
+                self._attr_media_title, self._attr_media_artist, self._attr_media_album_name = sample
+                self._attr_app_name = source
+            elif source == "TV":
+                self._attr_media_title = "电视直播"
+                self._attr_media_artist = None
+                self._attr_media_album_name = None
+                self._attr_app_name = None
+            else:
+                self._attr_media_title = None
+                self._attr_media_artist = None
+                self._attr_media_album_name = None
+                self._attr_app_name = None
+            if self._attr_state in (MediaPlayerState.IDLE, MediaPlayerState.OFF):
+                self._attr_state = MediaPlayerState.PLAYING
+        self.async_write_ha_state()
+
+    async def async_select_sound_mode(self, sound_mode: str) -> None:
+        if sound_mode in (self._attr_sound_mode_list or []):
+            self._attr_sound_mode = sound_mode
+        self.async_write_ha_state()
+
+    async def async_set_shuffle(self, shuffle: bool) -> None:
+        self._attr_shuffle = shuffle
+        self.async_write_ha_state()
+
+    async def async_set_repeat(self, repeat: str) -> None:
+        self._attr_repeat = repeat
+        self.async_write_ha_state()
+
+    async def async_play_media(self, media_type: str, media_id: str, **kwargs) -> None:
+        """播放指定媒体内容（URL / 媒体源）。"""
+        self._attr_media_content_id = media_id
+        self._attr_media_content_type = media_type
+        # 尝试从媒体 ID 提取标题（URL 尾部路径或整个 media_id）
+        title = kwargs.get("title", "") or kwargs.get("extra", {}).get("title", "")
+        if not title:
+            # 从 URL/路径中提取可读名称
+            clean = media_id.rstrip("/").split("/")[-1]
+            # 去除文件扩展名再 title-ize
+            name_part = clean.rsplit(".", 1)[0] if "." in clean else clean
+            title = name_part.replace("_", " ").replace("-", " ").replace("%20", " ").replace("+", " ").strip()
+        self._attr_media_title = title
+        self._attr_media_artist = kwargs.get("artist") or kwargs.get("extra", {}).get("artist", "")
+        self._attr_media_album_name = kwargs.get("album_name") or kwargs.get("extra", {}).get("album_name", "")
+        self._attr_media_image_url = kwargs.get("image_url") or kwargs.get("extra", {}).get("image_url", "")
+        # 设置时长：优先取传入值 → 探测文件 → 按媒体类型给默认值
+        duration = None
+        if "duration" in kwargs:
+            duration = kwargs["duration"]
+        elif "extra" in kwargs and "duration" in kwargs["extra"]:
+            duration = kwargs["extra"]["duration"]
+        else:
+            # 尝试从 media-source:// 本地文件读取真实时长
+            if self.hass and media_id and media_id.startswith("media-source://"):
+                try:
+                    path_part = urllib.parse.unquote(media_id.split("/local/", 1)[-1])
+                    if path_part:
+                        import os
+                        # 尝试多个可能的媒体目录（HA差速器/Docker挂载点不同）
+                        candidates = []
+                        try:
+                            candidates.append(self.hass.config.path("media"))
+                        except Exception:
+                            pass
+                        candidates.append("/media")
+                        for base in candidates:
+                            if not base:
+                                continue
+                            full = os.path.join(base, path_part)
+                            if os.path.isfile(full):
+                                try:
+                                    from mutagen import File as MFile
+                                    audio = await self.hass.async_add_executor_job(MFile, full)
+                                    if audio and audio.info:
+                                        length = audio.info.length
+                                        if length:
+                                            duration = int(length)
+                                except ImportError:
+                                    pass
+                                except Exception:
+                                    pass
+                                break
+                except Exception:
+                    pass
+        if duration is None:
+            # 按媒体类型推定默认时长
+            mt = (media_type or "").lower()
+            if mt.startswith("video/"):
+                duration = 1800  # 30 分钟
+            elif mt.startswith("audio/") or mt == "music":
+                duration = 300   # 5 分钟
+            else:
+                duration = 300
+        self._attr_media_duration = duration
+        self._attr_media_position = 0
+        self._attr_media_position_updated_at = time.time()
+        self._attr_state = MediaPlayerState.PLAYING
+        self.async_write_ha_state()
+
+    async def async_clear_playlist(self) -> None:
+        self._attr_media_title = None
+        self._attr_media_artist = None
+        self._attr_media_album_name = None
+        self._attr_media_content_id = None
+        self._attr_media_position = None
+        self._attr_media_position_updated_at = None
+        self.async_write_ha_state()
+
+    @property
+    def state(self) -> MediaPlayerState | None:
+        return self._attr_state
+
+    @property
+    def volume_level(self) -> float | None:
+        return self._attr_volume_level
+
+    @property
+    def is_volume_muted(self) -> bool:
+        return self._attr_is_volume_muted
+
+    @property
+    def source(self) -> str | None:
+        return self._attr_source
+
+    @property
+    def sound_mode(self) -> str | None:
+        return self._attr_sound_mode
+
+    @property
+    def media_title(self) -> str | None:
+        return self._attr_media_title
+
+    @property
+    def media_artist(self) -> str | None:
+        return self._attr_media_artist
+
+    @property
+    def media_album_name(self) -> str | None:
+        return self._attr_media_album_name
+
+    @property
+    def media_image_url(self) -> str | None:
+        return self._attr_media_image_url
+
+    @property
+    def media_content_id(self) -> str | None:
+        return self._attr_media_content_id
+
+    @property
+    def media_content_type(self) -> str | None:
+        return self._attr_media_content_type
+
+    @property
+    def media_duration(self) -> int | None:
+        return self._attr_media_duration
+
+    @property
+    def media_position(self) -> int | None:
+        return self._attr_media_position
+
+    @property
+    def media_position_updated_at(self) -> float | None:
+        return self._attr_media_position_updated_at
+
+    @property
+    def shuffle(self) -> bool | None:
+        return self._attr_shuffle
+
+    @property
+    def repeat(self) -> str | None:
+        return self._attr_repeat
+
+    @property
+    def app_name(self) -> str | None:
+        return self._attr_app_name
+
+
+# =========================================================================== #
+#  虚拟音箱/音响（完整功能：音量/音源/声音模式/播放控制）                            #
+# =========================================================================== #
+class VirtualSpeaker(MediaPlayerEntity, RestoreEntity):
+    """音响虚拟设备 — 模拟蓝牙音箱/HiFi音响等音频设备。"""
+    _attr_has_entity_name = True
+    _attr_should_poll = False
+    _attr_supported_features = (
+        MediaPlayerEntityFeature.PLAY |
+        MediaPlayerEntityFeature.PAUSE |
+        MediaPlayerEntityFeature.STOP |
+        MediaPlayerEntityFeature.TURN_ON |
+        MediaPlayerEntityFeature.TURN_OFF |
+        MediaPlayerEntityFeature.VOLUME_SET |
+        MediaPlayerEntityFeature.VOLUME_MUTE |
+        MediaPlayerEntityFeature.VOLUME_STEP |
+        MediaPlayerEntityFeature.SELECT_SOURCE |
+        MediaPlayerEntityFeature.SELECT_SOUND_MODE |
+        MediaPlayerEntityFeature.NEXT_TRACK |
+        MediaPlayerEntityFeature.PREVIOUS_TRACK |
+        MediaPlayerEntityFeature.PLAY_MEDIA |
+        MediaPlayerEntityFeature.SEEK |
+        MediaPlayerEntityFeature.CLEAR_PLAYLIST |
+        MediaPlayerEntityFeature.SHUFFLE_SET |
+        MediaPlayerEntityFeature.REPEAT_SET
+    )
+    _attr_source_list = ["AUX", "蓝牙(Bluetooth)", "光纤(Optical)", "同轴(Coaxial)", "USB", "WiFi", "AirPlay"]
+    _attr_sound_mode_list = ["标准", "流行", "古典", "摇滚", "爵士", "人声", "重低音", "3D环绕"]
+
+    def __init__(self, entity_id: str, name: str, device_info: DeviceInfo) -> None:
+        super().__init__()
+        self._attr_unique_id = f"{DOMAIN}_virtual_{entity_id}"
+        self._attr_name = name
+        self._attr_device_info = device_info
+        self._attr_state = MediaPlayerState.OFF
+        self._attr_volume_level = 0.3
+        self._attr_is_volume_muted = False
+        self._attr_source = "蓝牙(Bluetooth)"
+        self._attr_sound_mode = "标准"
+        self._attr_media_title = None
+        self._attr_media_artist = None
+        self._attr_media_album_name = None
+        self._attr_media_content_id = None
+        self._attr_media_content_type = None
+        self._attr_media_duration = None
+        self._attr_media_position = None
+        self._attr_media_position_updated_at = None
+        self._attr_shuffle = False
+        self._attr_repeat = "off"
+        self._attr_app_id = None
+        self._attr_app_name = None
+        self._attr_media_image_url = None
+        self.entity_id = entity_id
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        last = await self.async_get_last_state()
+        if last and last.state is not None:
+            try:
+                self._attr_state = MediaPlayerState(last.state)
+            except ValueError:
+                self._attr_state = MediaPlayerState.OFF
+        if last and last.attributes:
+            self._attr_volume_level = last.attributes.get("volume_level", 0.3)
+            self._attr_is_volume_muted = last.attributes.get("is_volume_muted", False)
+            self._attr_source = last.attributes.get("source", "蓝牙(Bluetooth)")
+            self._attr_sound_mode = last.attributes.get("sound_mode", "标准")
+            self._attr_media_title = last.attributes.get("media_title")
+            self._attr_media_artist = last.attributes.get("media_artist")
+            self._attr_media_album_name = last.attributes.get("media_album_name")
+            self._attr_media_content_id = last.attributes.get("media_content_id")
+            self._attr_media_duration = last.attributes.get("media_duration")
+            self._attr_media_position = last.attributes.get("media_position")
+            self._attr_shuffle = last.attributes.get("shuffle", False)
+            self._attr_repeat = last.attributes.get("repeat", "off")
+
+    async def async_turn_on(self) -> None:
+        self._attr_state = MediaPlayerState.IDLE
+        self.async_write_ha_state()
+
+    async def async_turn_off(self) -> None:
+        self._attr_state = MediaPlayerState.OFF
+        self.async_write_ha_state()
+
+    async def async_media_play(self) -> None:
+        self._attr_state = MediaPlayerState.PLAYING
+        if not self._attr_media_title:
+            self._attr_media_title = "音乐播放中..."
+            self._attr_media_artist = "未知艺术家"
+        self._attr_media_position_updated_at = time.time()
+        self.async_write_ha_state()
+
+    async def async_media_pause(self) -> None:
+        self._attr_state = MediaPlayerState.PAUSED
+        self.async_write_ha_state()
+
+    async def async_media_stop(self) -> None:
+        self._attr_state = MediaPlayerState.IDLE
+        self.async_write_ha_state()
+
+    async def async_media_seek(self, position: float) -> None:
+        """拖动进度条到指定位置。"""
+        self._attr_media_position = int(position)
+        self._attr_media_position_updated_at = time.time()
+        self.async_write_ha_state()
+
+    async def async_media_next_track(self) -> None:
+        self.async_write_ha_state()
+
+    async def async_media_previous_track(self) -> None:
+        self.async_write_ha_state()
+
+    async def async_set_volume_level(self, volume: float) -> None:
+        self._attr_volume_level = max(0.0, min(1.0, volume))
+        self.async_write_ha_state()
+
+    async def async_mute_volume(self, mute: bool) -> None:
+        self._attr_is_volume_muted = mute
+        self.async_write_ha_state()
+
+    async def async_select_source(self, source: str) -> None:
+        if source in (self._attr_source_list or []):
+            self._attr_source = source
+            if self._attr_state in (MediaPlayerState.IDLE, MediaPlayerState.OFF):
+                self._attr_state = MediaPlayerState.PLAYING
+        self.async_write_ha_state()
+
+    async def async_select_sound_mode(self, sound_mode: str) -> None:
+        if sound_mode in (self._attr_sound_mode_list or []):
+            self._attr_sound_mode = sound_mode
+        self.async_write_ha_state()
+
+    @property
+    def state(self) -> MediaPlayerState | None:
+        return self._attr_state
+
+    @property
+    def volume_level(self) -> float | None:
+        return self._attr_volume_level
+
+    @property
+    def is_volume_muted(self) -> bool:
+        return self._attr_is_volume_muted
+
+    @property
+    def source(self) -> str | None:
+        return self._attr_source
+
+    @property
+    def sound_mode(self) -> str | None:
+        return self._attr_sound_mode
+
+    @property
+    def media_title(self) -> str | None:
+        return self._attr_media_title
+
+    @property
+    def media_artist(self) -> str | None:
+        return self._attr_media_artist
+
+    @property
+    def media_album_name(self) -> str | None:
+        return self._attr_media_album_name
+
+    async def async_play_media(self, media_type: str, media_id: str, **kwargs) -> None:
+        """播放指定媒体内容（URL / 媒体源）。"""
+        self._attr_media_content_id = media_id
+        self._attr_media_content_type = media_type
+        title = kwargs.get("title", "") or kwargs.get("extra", {}).get("title", "")
+        if not title:
+            clean = media_id.rstrip("/").split("/")[-1]
+            name_part = clean.rsplit(".", 1)[0] if "." in clean else clean
+            title = name_part.replace("_", " ").replace("-", " ").replace("%20", " ").replace("+", " ").strip()
+        self._attr_media_title = title
+        self._attr_media_artist = kwargs.get("artist") or kwargs.get("extra", {}).get("artist", "")
+        self._attr_media_album_name = kwargs.get("album_name") or kwargs.get("extra", {}).get("album_name", "")
+        self._attr_media_image_url = kwargs.get("image_url") or kwargs.get("extra", {}).get("image_url", "")
+        duration = None
+        if "duration" in kwargs:
+            duration = kwargs["duration"]
+        elif "extra" in kwargs and "duration" in kwargs["extra"]:
+            duration = kwargs["extra"]["duration"]
+        else:
+            if self.hass and media_id and media_id.startswith("media-source://"):
+                try:
+                    path_part = urllib.parse.unquote(media_id.split("/local/", 1)[-1])
+                    if path_part:
+                        import os
+                        candidates = []
+                        try:
+                            candidates.append(self.hass.config.path("media"))
+                        except Exception:
+                            pass
+                        candidates.append("/media")
+                        for base in candidates:
+                            if not base:
+                                continue
+                            full = os.path.join(base, path_part)
+                            if os.path.isfile(full):
+                                try:
+                                    from mutagen import File as MFile
+                                    audio = await self.hass.async_add_executor_job(MFile, full)
+                                    if audio and audio.info:
+                                        length = audio.info.length
+                                        if length:
+                                            duration = int(length)
+                                except ImportError:
+                                    pass
+                                except Exception:
+                                    pass
+                                break
+                except Exception:
+                    pass
+        if duration is None:
+            mt = (media_type or "").lower()
+            if mt.startswith("video/"):
+                duration = 1800
+            elif mt.startswith("audio/") or mt == "music":
+                duration = 300
+            else:
+                duration = 300
+        self._attr_media_duration = duration
+        self._attr_media_position = 0
+        self._attr_media_position_updated_at = time.time()
+        self._attr_state = MediaPlayerState.PLAYING
+        self.async_write_ha_state()
+
+    async def async_clear_playlist(self) -> None:
+        self._attr_media_title = None
+        self._attr_media_artist = None
+        self._attr_media_album_name = None
+        self._attr_media_content_id = None
+        self._attr_media_position = None
+        self._attr_media_position_updated_at = None
+        self.async_write_ha_state()
+
+    async def async_set_shuffle(self, shuffle: bool) -> None:
+        self._attr_shuffle = shuffle
+        self.async_write_ha_state()
+
+    async def async_set_repeat(self, repeat: str) -> None:
+        self._attr_repeat = repeat
+        self.async_write_ha_state()
+
+    @property
+    def media_content_id(self) -> str | None:
+        return self._attr_media_content_id
+
+    @property
+    def media_content_type(self) -> str | None:
+        return self._attr_media_content_type
+
+    @property
+    def media_duration(self) -> int | None:
+        return self._attr_media_duration
+
+    @property
+    def media_position(self) -> int | None:
+        return self._attr_media_position
+
+    @property
+    def media_position_updated_at(self) -> float | None:
+        return self._attr_media_position_updated_at
+
+    @property
+    def shuffle(self) -> bool | None:
+        return self._attr_shuffle
+
+    @property
+    def repeat(self) -> str | None:
+        return self._attr_repeat
+
+    @property
+    def app_name(self) -> str | None:
+        return self._attr_app_name
+
+    @property
+    def media_image_url(self) -> str | None:
+        return self._attr_media_image_url
+
+
+# =========================================================================== #
 #  设备类型映射                                                                    #
 # =========================================================================== #
 VIRTUAL_DEVICE_CLASSES: dict[str, type] = {
@@ -640,6 +1290,8 @@ VIRTUAL_DEVICE_CLASSES: dict[str, type] = {
     "number": VirtualNumber,
     "select": VirtualSelect,
     "vacuum": VirtualVacuum,
+    "media": VirtualMedia,
+    "speaker": VirtualSpeaker,
 }
 
 
@@ -730,6 +1382,13 @@ class VirtualDeviceManager:
 
         entities = []
         domain = device_type
+        # media 和 speaker 类型都使用 media_player 域
+        media_types = {"media", "speaker"}
+        if device_type in media_types:
+            domain = "media_player"
+            if not entity_id.startswith("media_player."):
+                entity_id = f"media_player.{entity_id.split('.', 1)[1] if '.' in entity_id else entity_id}"
+                config["entity_id"] = entity_id
 
         # 创建实体
         extra_sensors = []  # 附属传感器，需要走 sensor 平台
@@ -843,4 +1502,5 @@ class VirtualDeviceManager:
                 "cover": "窗帘", "fan": "风扇", "lock": "门锁",
                 "sensor": "传感器", "binary_sensor": "二元传感器",
                 "number": "数值", "select": "选择器",
-                "vacuum": "扫地机器人"}.get(t, t)
+                "vacuum": "扫地机器人",
+                "media": "媒体播放器", "speaker": "音响/音箱"}.get(t, t)

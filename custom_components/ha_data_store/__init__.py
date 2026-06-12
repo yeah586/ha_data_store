@@ -45,6 +45,8 @@ from .const import (
     TABLE_BRIDGE_CONNECTIONS,
     TABLE_BRIDGE_ENTITIES,
     TABLE_HEALTH_RECORDS,
+    TABLE_MEDIA_PLAYLISTS,
+    TABLE_MEDIA_QUEUE,
     CATEGORY_DEVICE,
     CATEGORY_ENVIRONMENT,
     CATEGORY_ATTRIBUTE,
@@ -71,6 +73,7 @@ PLATFORMS: list[str] = [
     "switch", "sensor",
     "light", "climate", "cover", "fan", "lock",
     "number", "select", "binary_sensor", "vacuum",
+    "media_player",
 ]
 
 
@@ -353,6 +356,38 @@ def _init_database(db_path: str) -> None:
         )
         conn.execute(
             f"CREATE INDEX IF NOT EXISTS idx_health_name_time ON {TABLE_HEALTH_RECORDS} (name, date_time);"
+        )
+        # 14) 媒体播放列表表 — 存储用户播放列表名称 + 歌曲 JSON
+        conn.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {TABLE_MEDIA_PLAYLISTS} (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_name   TEXT NOT NULL,
+                name        TEXT NOT NULL DEFAULT '',
+                songs       TEXT NOT NULL DEFAULT '[]',
+                created_at  TEXT NOT NULL DEFAULT '',
+                updated_at  TEXT NOT NULL DEFAULT '',
+                UNIQUE(user_name, name)
+            )
+            """
+        )
+        # 迁移：补充 songs 列（旧表）
+        mp_columns = [row[1] for row in conn.execute(f"PRAGMA table_info({TABLE_MEDIA_PLAYLISTS})")]
+        if "songs" not in mp_columns:
+            conn.execute(f"ALTER TABLE {TABLE_MEDIA_PLAYLISTS} ADD COLUMN songs TEXT NOT NULL DEFAULT '[]'")
+        # 15) 媒体播放队列表 — 后端列表播放
+        conn.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {TABLE_MEDIA_QUEUE} (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                entity_id     TEXT NOT NULL UNIQUE,
+                tracks        TEXT NOT NULL DEFAULT '[]',
+                current_index INTEGER NOT NULL DEFAULT 0,
+                is_active     INTEGER NOT NULL DEFAULT 0,
+                created_at    TEXT NOT NULL DEFAULT '',
+                updated_at    TEXT NOT NULL DEFAULT ''
+            )
+            """
         )
 
         if local_logger:
@@ -1584,9 +1619,9 @@ def _write_env_metric_record(
     value: float | str | None,
     room: str = "",
 ) -> None:
-    """向对应的指标分表写入一条记录。数值类型保留2位小数，sensor 类型原样存入。"""
+    """向对应的指标分表写入一条记录。数值类型保留3位小数，sensor 类型原样存入。"""
     if value is not None and metric_type != METRIC_SENSOR:
-        value = round(value, 2)
+        value = round(value, 3)
 
     tbl = get_env_table_name(metric_type)
     conn = sqlite3.connect(db_path)
@@ -3065,10 +3100,10 @@ async def _async_env_poll(hass: HomeAssistant, db_path: str, now=None) -> None:
         if not state or state.state in ("unavailable", "unknown", None):
             continue
 
-        # 提取数值：sensor 类型优先转 float 并保留2位小数，非数值则原样存字符串
+        # 提取数值：sensor 类型优先转 float 并保留3位小数，非数值则原样存字符串
         if metric_type == METRIC_SENSOR:
             try:
-                value = round(float(state.state), 2)
+                value = round(float(state.state), 3)
             except (ValueError, TypeError):
                 value = state.state
         else:
@@ -3351,6 +3386,9 @@ def _register_api_views(hass: HomeAssistant, db_path: str) -> None:
         HealthAddView,
         HealthTypesView,
         HealthDeleteView,
+        MediaPlaylistView,
+        MediaQueueView,
+        TableColumnsView,
     )
     hass.http.register_view(EntityConfigView(db_path))
     hass.http.register_view(EntityConfigListView(db_path))
@@ -3388,6 +3426,9 @@ def _register_api_views(hass: HomeAssistant, db_path: str) -> None:
     hass.http.register_view(HealthAddView(db_path))
     hass.http.register_view(HealthTypesView(db_path))
     hass.http.register_view(HealthDeleteView(db_path))
+    hass.http.register_view(MediaPlaylistView(db_path))
+    hass.http.register_view(MediaQueueView(db_path))
+    hass.http.register_view(TableColumnsView(db_path))
 
 
 # =========================================================================== #
@@ -3423,6 +3464,78 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.data[DOMAIN].setdefault("allow_remote_access", False)
 
     _register_api_views(hass, db_path)
+
+    # ── 媒体播放队列：后端自动切歌 ──
+    import json as _json
+
+    def _handle_media_queue_event(event) -> None:
+        """监听 media_player 状态变化，自动推进播放队列。"""
+        entity_id = event.data.get("entity_id", "")
+        if not entity_id or not entity_id.startswith("media_player."):
+            return
+        old_state = event.data.get("old_state")
+        new_state = event.data.get("new_state")
+        if not new_state or not old_state:
+            return
+        # 只处理从 playing 变为 idle/paused 的情况
+        if old_state.state != "playing" or new_state.state not in ("idle", "paused"):
+            return
+        # 检查是否有人在听歌中途暂停（位置远小于总时长）
+        old_pos = (old_state.attributes or {}).get("media_position", 0) or 0
+        old_dur = (old_state.attributes or {}).get("media_duration", 0) or 0
+        if old_dur > 0 and old_pos < old_dur * 0.85:
+            return  # 用户手动暂停，不切歌
+        # 查询该实体是否有活跃队列
+        import sqlite3
+        try:
+            conn = sqlite3.connect(db_path)
+            try:
+                row = conn.execute(
+                    f"SELECT * FROM {TABLE_MEDIA_QUEUE} WHERE entity_id = ? AND is_active = 1",
+                    (entity_id,),
+                ).fetchone()
+                if not row:
+                    return
+                tracks = _json.loads(row[2]) if isinstance(row[2], str) else []
+                cur_idx = int(row[3])
+                next_idx = cur_idx + 1
+                if next_idx >= len(tracks):
+                    # 播完，停止队列
+                    conn.execute(
+                        f"UPDATE {TABLE_MEDIA_QUEUE} SET is_active = 0, updated_at = ? WHERE entity_id = ?",
+                        (__import__('datetime').datetime.now().strftime("%Y-%m-%d %H:%M:%S"), entity_id),
+                    )
+                    conn.commit()
+                    _LOGGER.info("[media_queue] 列表播放完成 entity=%s", entity_id)
+                    return
+                next_track = tracks[next_idx]
+                media_id = next_track.get("media_content_id") or next_track.get("url", "")
+                if not media_id:
+                    return
+                # 更新索引
+                now = __import__('datetime').datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                conn.execute(
+                    f"UPDATE {TABLE_MEDIA_QUEUE} SET current_index = ?, updated_at = ? WHERE entity_id = ?",
+                    (next_idx, now, entity_id),
+                )
+                conn.commit()
+                # 调用 HA 服务播放下一首
+                hass.async_create_task(
+                    hass.services.async_call(
+                        "media_player", "play_media",
+                        {"entity_id": entity_id, "media_content_id": media_id,
+                         "media_content_type": next_track.get("media_type", "music")},
+                    )
+                )
+                _LOGGER.info("[media_queue] 自动切歌 entity=%s idx=%d->%d title=%s",
+                             entity_id, cur_idx, next_idx, next_track.get("title", ""))
+            finally:
+                conn.close()
+        except Exception:
+            _LOGGER.exception("[media_queue] 切歌处理异常 entity=%s", entity_id)
+
+    hass.bus.async_listen("state_changed", _handle_media_queue_event)
+    _LOGGER.info("[media_queue] 后端列表播放监听已启动")
 
     # ── 方案一：启动时从 pending JSON 恢复丢失的关机事件 ──
     async def _recover_pending_on_startup(_now=None) -> None:

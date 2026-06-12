@@ -44,6 +44,8 @@ from .const import (
     TABLE_BRIDGE_CONNECTIONS,
     TABLE_BRIDGE_ENTITIES,
     TABLE_HEALTH_RECORDS,
+    TABLE_MEDIA_PLAYLISTS,
+    TABLE_MEDIA_QUEUE,
     CATEGORY_DEVICE,
     CATEGORY_ENVIRONMENT,
     CATEGORY_ATTRIBUTE,
@@ -720,7 +722,7 @@ class QueryView(_BaseDBView):
         query_type = request.query.get("type", "").strip().lower()
         if not query_type:
             return self.json(
-                {"success": False, "error": "缺少 type 参数，可选: device_history, device_summary, env_history, env_latest, attr_history, attr_latest, entities, rooms_daily, rooms_multi_metric, vacuum_history, entity_data_dates, aggregate_daily, aggregate_monthly, aggregate_yearly, ranking_daily, ranking_monthly, ranking_yearly, electricity_standard"},
+                {"success": False, "error": "缺少 type 参数，可选: device_history, device_summary, env_history, env_latest, attr_history, attr_latest, attr_daily, entities, rooms_daily, rooms_multi_metric, vacuum_history, entity_data_dates, aggregate_daily, aggregate_monthly, aggregate_yearly, ranking_daily, ranking_monthly, ranking_yearly, electricity_standard"},
                 status_code=400,
             )
 
@@ -742,6 +744,8 @@ class QueryView(_BaseDBView):
                 result = await self._exec_in_executor(hass, self._query_attr_history, db_path, request)
             elif query_type == "attr_latest":
                 result = await self._exec_in_executor(hass, self._query_attr_latest, db_path, request)
+            elif query_type == "attr_daily":
+                result = await self._exec_in_executor(hass, self._query_attr_daily, db_path, request)
             elif query_type == "entities":
                 result = await self._exec_in_executor(hass, self._query_entities, db_path, request)
             elif query_type == "rooms_daily":
@@ -1708,7 +1712,7 @@ class QueryView(_BaseDBView):
         return {"on_count": 0, "total_energy": 0, "total_duration": 0}
 
     # ------------------------------------------------------------------ #
-    #  attr_history：属性历史记录                                           #
+    #  attr_history：属性历史记录（支持多选表，每个表独立节点）                    #
     # ------------------------------------------------------------------ #
     def _query_attr_history(self, db_path: str, request: web.Request) -> dict:
         params = self._extract_params(request)
@@ -1716,14 +1720,22 @@ class QueryView(_BaseDBView):
         room = params["room"]
         date = params["date"]
         limit = params["limit"] or 500
-        attr_type = request.query.get("attr_type", "").strip()
+        attr_type_raw = request.query.get("attr_type", "").strip()
+        order_by = request.query.get("order_by", "").strip()
+        try:
+            offset = int(request.query.get("offset", "0").strip())
+        except ValueError:
+            offset = 0
+        fields_raw = request.query.get("fields", "").strip()
 
         if not entity_id and not room:
             raise ValueError("attr_history 需要 entity_id 或 room 参数")
-        if not attr_type:
+        if not attr_type_raw:
             raise ValueError("attr_history 需要 attr_type 参数")
 
-        tbl = get_attr_table_name(attr_type)
+        # 支持逗号分隔的多类型
+        attr_types = [a.strip() for a in attr_type_raw.split(",") if a.strip()]
+
         conn = sqlite3.connect(db_path)
         try:
             conn.row_factory = sqlite3.Row
@@ -1742,27 +1754,55 @@ class QueryView(_BaseDBView):
 
             where_clause = " AND ".join(conditions) if conditions else "1=1"
 
-            # 获取列名（排除 _rowid）
-            table_info = conn.execute(f"PRAGMA table_info({tbl})").fetchall()
-            col_names = [row[1] for row in table_info if row[1] != "id"]
+            records_by_table = {}
+            all_tables = []
+            grand_total = 0
 
-            cursor = conn.execute(
-                f"SELECT * FROM {tbl} WHERE {where_clause} "
-                f"ORDER BY datetime DESC LIMIT ?",
-                (*sql_params, limit),
-            )
-            records = [dict(row) for row in cursor.fetchall()]
+            for attr_type in attr_types:
+                tbl = get_attr_table_name(attr_type)
+                all_tables.append(tbl)
 
-            # 总条数
-            count_row = conn.execute(
-                f"SELECT COUNT(*) FROM {tbl} WHERE {where_clause}",
-                sql_params,
-            ).fetchone()
-            total = count_row[0] if count_row else 0
+                try:
+                    # 获取列名
+                    table_info = conn.execute(f"PRAGMA table_info({tbl})").fetchall()
+                    col_names = [row[1] for row in table_info if row[1] != "id"]
 
-            return {"records": records, "total": total, "table": tbl, "columns": col_names}
+                    cursor = conn.execute(
+                        f"SELECT * FROM {tbl} WHERE {where_clause} "
+                        f"ORDER BY datetime DESC LIMIT ?",
+                        (*sql_params, limit),
+                    )
+                    batch = [dict(row) for row in cursor.fetchall()]
+
+                    # 统计该表总条数
+                    count_row = conn.execute(
+                        f"SELECT COUNT(*) FROM {tbl} WHERE {where_clause}",
+                        sql_params,
+                    ).fetchone()
+                    tbl_total = count_row[0] if count_row else 0
+
+                    records_by_table[tbl] = {
+                        "records": batch,
+                        "total": tbl_total,
+                        "columns": col_names,
+                    }
+                    grand_total += tbl_total
+                except Exception:
+                    records_by_table[tbl] = {
+                        "records": [],
+                        "total": 0,
+                        "columns": [],
+                        "error": "表不存在或查询失败",
+                    }
+                    _LOGGER.warning("[query] attr_history 表 %s 不存在或查询失败", tbl)
+
+            return {
+                "records": records_by_table,
+                "total": grand_total,
+                "tables": all_tables,
+            }
         except Exception:
-            return {"records": [], "total": 0, "error": f"表 {tbl} 可能不存在"}
+            return {"records": {}, "total": 0, "error": f"表查询失败: {', '.join(get_attr_table_name(a) for a in attr_types)}"}
         finally:
             conn.close()
 
@@ -1856,7 +1896,7 @@ class QueryView(_BaseDBView):
         return {"on_count": 0, "total_energy": 0, "total_duration": 0}
 
     # ------------------------------------------------------------------ #
-    #  attr_history：属性历史记录 + 汇总                                       #
+    #  attr_history：属性历史记录 + 汇总（支持多选表）                            #
     # ------------------------------------------------------------------ #
     def _query_attr_history(self, db_path: str, request: web.Request) -> dict:
         params = self._extract_params(request)
@@ -1864,7 +1904,7 @@ class QueryView(_BaseDBView):
         room = params["room"]
         date = params["date"]
         limit = params["limit"] or 500
-        attr_type = request.query.get("attr_type", "").strip()
+        attr_type_raw = request.query.get("attr_type", "").strip()
         order_by = request.query.get("order_by", "").strip()
         try:
             offset = int(request.query.get("offset", "0").strip())
@@ -1874,10 +1914,12 @@ class QueryView(_BaseDBView):
 
         if not entity_id and not room:
             raise ValueError("attr_history 需要 entity_id 或 room 参数")
-        if not attr_type:
+        if not attr_type_raw:
             raise ValueError("attr_history 需要 attr_type 参数")
 
-        tbl = get_attr_table_name(attr_type)
+        # 支持逗号分隔的多类型
+        attr_types = [a.strip() for a in attr_type_raw.split(",") if a.strip()]
+
         conn = sqlite3.connect(db_path)
         try:
             conn.row_factory = sqlite3.Row
@@ -1896,83 +1938,93 @@ class QueryView(_BaseDBView):
 
             where_clause = " AND ".join(conditions) if conditions else "1=1"
 
-            # 获取列名和类型
-            table_info = conn.execute(f"PRAGMA table_info({tbl})").fetchall()
-            all_col_names = [row[1] for row in table_info]
-            safe_cols = {row[1] for row in table_info}
-            col_names = [c for c in all_col_names if c != "id"]
-            numeric_cols = [
-                row[1] for row in table_info
-                if row[1] not in ("id", "entity_id", "name", "datetime", "room", "updated_at")
-                and row[2].upper() in ("REAL", "INTEGER")
-            ]
+            all_records = []
+            all_tables = []
+            all_columns = set()
+            combined_summary = {}
 
-            # 字段过滤
-            if fields_raw:
-                requested = [f.strip() for f in fields_raw.split(",") if f.strip() in safe_cols]
-                select_fields = ", ".join(f'"{f}"' for f in requested) if requested else "*"
-            else:
-                select_fields = "*"
-                requested = col_names
+            for attr_type in attr_types:
+                tbl = get_attr_table_name(attr_type)
+                all_tables.append(tbl)
 
-            # 排序
-            order_clause = "ORDER BY datetime DESC"
-            if order_by and order_by.lstrip("-") in safe_cols:
-                direction = "DESC" if order_by.startswith("-") else "ASC"
-                col = order_by.lstrip("-")
-                order_clause = f'ORDER BY "{col}" {direction}'
+                try:
+                    # 获取列名和类型
+                    table_info = conn.execute(f"PRAGMA table_info({tbl})").fetchall()
+                    col_names = [row[1] for row in table_info if row[1] != "id"]
 
-            cursor = conn.execute(
-                f"SELECT {select_fields} FROM {tbl} WHERE {where_clause} "
-                f"{order_clause} LIMIT ? OFFSET ?",
-                (*sql_params, limit, offset),
-            )
-            records = [dict(row) for row in cursor.fetchall()]
+                    # 字段过滤
+                    safe_cols = {row[1] for row in table_info}
+                    if fields_raw:
+                        requested = [f.strip() for f in fields_raw.split(",") if f.strip() in safe_cols]
+                        select_fields = ", ".join(f'"{f}"' for f in requested) if requested else "*"
+                    else:
+                        select_fields = "*"
 
-            # 总条数
-            count_row = conn.execute(
-                f"SELECT COUNT(*) FROM {tbl} WHERE {where_clause}",
-                sql_params,
-            ).fetchone()
-            total = count_row[0] if count_row else 0
+                    # 排序
+                    order_clause = "ORDER BY datetime DESC"
+                    if order_by and order_by.lstrip("-") in safe_cols:
+                        direction = "DESC" if order_by.startswith("-") else "ASC"
+                        col = order_by.lstrip("-")
+                        order_clause = f'ORDER BY "{col}" {direction}'
 
-            # 汇总统计（独立 try，失败不影响返回记录）
-            summary = {}
-            _LOGGER.warning("[query] attr_history 开始汇总 tbl=%s numeric_cols=%s",
-                            tbl, numeric_cols)
-            try:
-                if numeric_cols:
-                    agg_parts = []
-                    for col in numeric_cols:
-                        qn = f'"{col}"'
-                        agg_parts.append(f"SUM({qn}) AS sum_{col}")
-                        agg_parts.append(f"AVG({qn}) AS avg_{col}")
-                        agg_parts.append(f"MIN({qn}) AS min_{col}")
-                        agg_parts.append(f"MAX({qn}) AS max_{col}")
-                    agg_sql = ", ".join(agg_parts)
-                    agg_row = conn.execute(
-                        f"SELECT COUNT(*) AS cnt, {agg_sql} FROM {tbl} WHERE {where_clause}",
-                        sql_params,
-                    ).fetchone()
-                    if agg_row:
+                    cursor = conn.execute(
+                        f"SELECT {select_fields} FROM {tbl} WHERE {where_clause} "
+                        f"{order_clause} LIMIT ? OFFSET ?",
+                        (*sql_params, limit, offset),
+                    )
+                    batch = [dict(row) for row in cursor.fetchall()]
+                    for rec in batch:
+                        rec["_table"] = tbl
+                    all_records.extend(batch)
+                    all_columns.update(col_names)
+
+                    # 汇总统计
+                    numeric_cols = [
+                        row[1] for row in table_info
+                        if row[1] not in ("id", "entity_id", "name", "datetime", "room", "updated_at", "_table")
+                        and row[2].upper() in ("REAL", "INTEGER")
+                    ]
+                    if numeric_cols:
+                        agg_parts = []
                         for col in numeric_cols:
-                            s_val = agg_row[f"sum_{col}"]
-                            a_val = agg_row[f"avg_{col}"]
-                            n_val = agg_row[f"min_{col}"]
-                            x_val = agg_row[f"max_{col}"]
-                            summary[col] = {
-                                "sum": round(float(s_val), 2) if s_val is not None else 0,
-                                "avg": round(float(a_val), 2) if a_val is not None else 0,
-                                "min": round(float(n_val), 2) if n_val is not None else 0,
-                                "max": round(float(x_val), 2) if x_val is not None else 0,
-                            }
-            except Exception as e:
-                _LOGGER.warning("[query] attr_history 汇总计算失败 tbl=%s: %s", tbl, e)
+                            qn = f'"{col}"'
+                            agg_parts.append(f"SUM({qn}) AS sum_{col}")
+                            agg_parts.append(f"AVG({qn}) AS avg_{col}")
+                            agg_parts.append(f"MIN({qn}) AS min_{col}")
+                            agg_parts.append(f"MAX({qn}) AS max_{col}")
+                        agg_sql = ", ".join(agg_parts)
+                        agg_row = conn.execute(
+                            f"SELECT COUNT(*) AS cnt, {agg_sql} FROM {tbl} WHERE {where_clause}",
+                            sql_params,
+                        ).fetchone()
+                        if agg_row:
+                            key = f"_{tbl}"
+                            combined_summary[attr_type] = {}
+                            for col in numeric_cols:
+                                s_val = agg_row[f"sum_{col}"]
+                                a_val = agg_row[f"avg_{col}"]
+                                n_val = agg_row[f"min_{col}"]
+                                x_val = agg_row[f"max_{col}"]
+                                combined_summary[attr_type][col] = {
+                                    "sum": round(float(s_val), 2) if s_val is not None else 0,
+                                    "avg": round(float(a_val), 2) if a_val is not None else 0,
+                                    "min": round(float(n_val), 2) if n_val is not None else 0,
+                                    "max": round(float(x_val), 2) if x_val is not None else 0,
+                                }
+                except Exception:
+                    _LOGGER.warning("[query] attr_history 表 %s 不存在或查询失败", tbl)
 
-            return {"records": records, "total": total, "table": tbl, "columns": col_names,
-                    "summary": summary}
+            total = len(all_records)
+            tables_str = ", ".join(all_tables)
+
+            return {
+                "records": all_records, "total": total,
+                "tables": all_tables, "table": tables_str,
+                "columns": sorted(all_columns) if all_columns else [],
+                "summary": combined_summary,
+            }
         except Exception:
-            return {"records": [], "total": 0, "error": f"表 {tbl} 可能不存在"}
+            return {"records": [], "total": 0, "error": f"表查询失败: {', '.join(get_attr_table_name(a) for a in attr_types)}"}
         finally:
             conn.close()
 
@@ -2045,22 +2097,32 @@ class QueryView(_BaseDBView):
             conn.close()
 
     # ------------------------------------------------------------------ #
-    #  attr_history：属性历史记录                                           #
+    #  attr_history：属性历史记录（单表兼容旧格式，多表按表分组，支持start/end范围）#
     # ------------------------------------------------------------------ #
     def _query_attr_history(self, db_path: str, request: web.Request) -> dict:
         params = self._extract_params(request)
         entity_id = params["entity_id"]
         room = params["room"]
         date = params["date"]
+        start = params["start"]
+        end = params["end"]
         limit = params["limit"] or 500
-        attr_type = request.query.get("attr_type", "").strip()
+        attr_type_raw = request.query.get("attr_type", "").strip()
+        order_by = request.query.get("order_by", "").strip()
+        try:
+            offset = int(request.query.get("offset", "0").strip())
+        except ValueError:
+            offset = 0
+        fields_raw = request.query.get("fields", "").strip()
 
         if not entity_id and not room:
             raise ValueError("attr_history 需要 entity_id 或 room 参数")
-        if not attr_type:
+        if not attr_type_raw:
             raise ValueError("attr_history 需要 attr_type 参数")
 
-        tbl = get_attr_table_name(attr_type)
+        # 支持逗号分隔的多类型
+        attr_types = [a.strip() for a in attr_type_raw.split(",") if a.strip()]
+
         conn = sqlite3.connect(db_path)
         try:
             conn.row_factory = sqlite3.Row
@@ -2076,30 +2138,182 @@ class QueryView(_BaseDBView):
             if date:
                 conditions.append("datetime LIKE ?")
                 sql_params.append(f"{date}%")
+            if start:
+                conditions.append("datetime >= ?")
+                sql_params.append(start)
+            if end:
+                conditions.append("datetime <= ?")
+                sql_params.append(end + " 23:59:59")
 
             where_clause = " AND ".join(conditions) if conditions else "1=1"
 
-            # 获取列名（排除 _rowid）
+            records_by_table = {}
+            all_tables = []
+            grand_total = 0
+
+            for attr_type in attr_types:
+                tbl = get_attr_table_name(attr_type)
+                all_tables.append(tbl)
+
+                try:
+                    table_info = conn.execute(f"PRAGMA table_info({tbl})").fetchall()
+                    col_names = [row[1] for row in table_info if row[1] != "id"]
+
+                    cursor = conn.execute(
+                        f"SELECT * FROM {tbl} WHERE {where_clause} "
+                        f"ORDER BY datetime DESC LIMIT ?",
+                        (*sql_params, limit),
+                    )
+                    batch = [dict(row) for row in cursor.fetchall()]
+
+                    count_row = conn.execute(
+                        f"SELECT COUNT(*) FROM {tbl} WHERE {where_clause}",
+                        sql_params,
+                    ).fetchone()
+                    tbl_total = count_row[0] if count_row else 0
+
+                    records_by_table[tbl] = {
+                        "records": batch,
+                        "total": tbl_total,
+                        "columns": col_names,
+                    }
+                    grand_total += tbl_total
+                except Exception:
+                    records_by_table[tbl] = {
+                        "records": [],
+                        "total": 0,
+                        "columns": [],
+                        "error": "表不存在或查询失败",
+                    }
+                    _LOGGER.warning("[query] attr_history 表 %s 不存在或查询失败", tbl)
+
+            # 单表保持旧格式兼容，多表按表分组
+            is_multi = len(attr_types) > 1
+            single_tbl = all_tables[0] if all_tables else ""
+
+            if is_multi:
+                return {
+                    "records": records_by_table,
+                    "total": grand_total,
+                    "tables": all_tables,
+                }
+            else:
+                tbl_info = records_by_table.get(single_tbl, {})
+                return {
+                    "records": tbl_info.get("records", []),
+                    "total": tbl_info.get("total", 0),
+                    "table": single_tbl,
+                    "columns": tbl_info.get("columns", []),
+                }
+        except Exception:
+            if len(attr_types) > 1:
+                return {"records": {}, "total": 0, "tables": [get_attr_table_name(a) for a in attr_types], "error": f"表查询失败: {', '.join(get_attr_table_name(a) for a in attr_types)}"}
+            tbl = get_attr_table_name(attr_types[0]) if attr_types else ""
+            return {"records": [], "total": 0, "table": tbl, "columns": [], "error": f"表 {tbl} 可能不存在"}
+        finally:
+            conn.close()
+
+    # ------------------------------------------------------------------ #
+    #  attr_daily：按天返回指定月份的属性记录（仅单表）                         #
+    # ------------------------------------------------------------------ #
+    def _query_attr_daily(self, db_path: str, request: web.Request) -> dict:
+        """返回指定月份每一天的属性记录分组。
+        参数: attr_type(单表), entity_id, month(YYYY-MM), date_field(可选，默认从表列名自动检测)
+        """
+        params = self._extract_params(request)
+        entity_id = params["entity_id"]
+        month = params["month"]
+        attr_type_raw = request.query.get("attr_type", "").strip()
+        date_field = request.query.get("date_field", "").strip()
+
+        if not entity_id:
+            raise ValueError("attr_daily 需要 entity_id 参数")
+        if not attr_type_raw:
+            raise ValueError("attr_daily 需要 attr_type 参数")
+        if not month:
+            raise ValueError("attr_daily 需要 month 参数（格式：YYYY-MM）")
+
+        import re
+        if not re.match(r"^\d{4}-\d{2}$", month):
+            raise ValueError("month 参数格式错误，应为 YYYY-MM")
+
+        # 仅支持单表
+        if "," in attr_type_raw:
+            raise ValueError("attr_daily 仅支持单表查询，请指定一个 attr_type")
+        attr_type = attr_type_raw.strip()
+        tbl = get_attr_table_name(attr_type)
+
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.row_factory = sqlite3.Row
+
+            # 从表结构自动检测日期字段
             table_info = conn.execute(f"PRAGMA table_info({tbl})").fetchall()
+            if not table_info:
+                return {
+                    "entity_id": entity_id, "attr_type": attr_type,
+                    "month": month, "table": tbl,
+                    "daily_records": [], "error": f"表 {tbl} 不存在",
+                }
+
             col_names = [row[1] for row in table_info if row[1] != "id"]
 
+            if not date_field:
+                # 优先 datetime，其次按常见日期字段名匹配
+                if "datetime" in col_names:
+                    date_field = "datetime"
+                else:
+                    candidates = [c for c in col_names if c in ("on_time", "date", "day", "created_at", "updated_at")]
+                    if not candidates:
+                        candidates = [c for c in col_names if "time" in c.lower() or "date" in c.lower()]
+                    date_field = candidates[0] if candidates else col_names[0]
+            elif date_field not in col_names:
+                raise ValueError(f"日期字段 '{date_field}' 在表 {tbl} 中不存在，可选字段: {', '.join(col_names)}")
+
+            pattern = f"{month}-%"
             cursor = conn.execute(
-                f"SELECT * FROM {tbl} WHERE {where_clause} "
-                f"ORDER BY datetime DESC LIMIT ?",
-                (*sql_params, limit),
+                f"SELECT * FROM {tbl} WHERE entity_id = ? AND {date_field} LIKE ? "
+                f"ORDER BY {date_field} DESC",
+                (entity_id, pattern),
             )
-            records = [dict(row) for row in cursor.fetchall()]
+            all_rows = [dict(row) for row in cursor.fetchall()]
 
-            # 总条数
-            count_row = conn.execute(
-                f"SELECT COUNT(*) FROM {tbl} WHERE {where_clause}",
-                sql_params,
-            ).fetchone()
-            total = count_row[0] if count_row else 0
+            daily: dict[str, list] = {}
+            for row in all_rows:
+                val = str(row.get(date_field, ""))
+                day_key = val[:10] if len(val) >= 10 else val
+                daily.setdefault(day_key, []).append(row)
 
-            return {"records": records, "total": total, "table": tbl, "columns": col_names}
-        except Exception:
-            return {"records": [], "total": 0, "error": f"表 {tbl} 可能不存在"}
+            daily_records = []
+            for day_key in sorted(daily.keys(), reverse=True):
+                daily_records.append({
+                    "date": day_key,
+                    "records": daily[day_key],
+                    "count": len(daily[day_key]),
+                })
+
+            # 取第一条记录的日期字段值作为参考
+            sample_val = str(all_rows[0].get(date_field, ""))[:19] if all_rows else None
+
+            return {
+                "entity_id": entity_id,
+                "attr_type": attr_type,
+                "table": tbl,
+                "month": month,
+                "date_field": date_field,
+                "daily_records": daily_records,
+                "total_days": len(daily_records),
+                "columns": col_names,
+                "total_rows": len(all_rows),
+                "sample_date_value": sample_val,
+            }
+        except Exception as exc:
+            _LOGGER.exception("[query] attr_daily 查询异常")
+            return {
+                "entity_id": entity_id, "attr_type": attr_type,
+                "month": month, "table": tbl,
+                "daily_records": [], "error": str(exc),
+            }
         finally:
             conn.close()
 
@@ -4047,6 +4261,31 @@ def _normalize_extra_fields_api(extra_fields) -> dict:
     return result
 
 
+class TableColumnsView(_BaseDBView):
+    """获取指定数据表的列名。"""
+
+    url = "/api/ha_data_store/table_columns"
+    name = "api:ha_data_store:table_columns"
+
+    async def get(self, request: web.Request) -> web.Response:
+        db_path = self._db_path
+        table = request.query.get("table", "").strip()
+        if not table:
+            return self.json({"success": False, "error": "缺少 table 参数"}, status_code=400)
+
+        import sqlite3
+        try:
+            conn = sqlite3.connect(db_path)
+            try:
+                cursor = conn.execute(f"PRAGMA table_info(`{table}`)")
+                columns = [{"cid": r[0], "name": r[1], "type": r[2]} for r in cursor.fetchall()]
+                return self.json({"success": True, "data": columns})
+            finally:
+                conn.close()
+        except Exception as exc:
+            return self.json({"success": False, "error": str(exc)}, status_code=500)
+
+
 class AttrConfigView(_BaseDBView):
     """属性提取配置管理。"""
 
@@ -5740,7 +5979,7 @@ class VirtualDeviceView(_BaseDBView):
         if not all(ord(c) < 128 for c in entity_id):
             return self.json({"success": False, "error": "entity_id 必须为纯英文（如 light.test）"}, status_code=400)
 
-        valid_types = ["switch", "light", "climate", "cover", "fan", "lock", "sensor", "binary_sensor", "number", "select", "vacuum"]
+        valid_types = ["switch", "light", "climate", "cover", "fan", "lock", "sensor", "binary_sensor", "number", "select", "vacuum", "media", "speaker"]
         if device_type not in valid_types:
             return self.json({"success": False, "error": f"类型需为 {', '.join(valid_types)}"}, status_code=400)
 
@@ -6003,6 +6242,314 @@ class HealthDeleteView(_BaseDBView):
         try:
             await self._exec_in_executor(hass, _delete)
             return self.json({"success": True, "message": f"记录 {record_id} 已删除"})
+        except Exception as exc:
+            return self.json({"success": False, "error": str(exc)}, status_code=500)
+
+
+# ===========================================================================
+#  媒体播放列表管理 API                                                         #
+# ===========================================================================
+class MediaPlaylistView(_BaseDBView):
+    """管理用户播放列表。
+    GET    /api/ha_data_store/media/playlists?user=xxx   → 列出用户播放列表
+    GET    /api/ha_data_store/media/users                → 列出所有用户
+    POST   /api/ha_data_store/media/playlist             → 新增/重命名播放列表
+    DELETE /api/ha_data_store/media/playlist?id=xxx      → 删除播放列表
+    """
+
+    url = "/api/ha_data_store/media/playlists"
+    name = "api:ha_data_store:media_playlists"
+
+    async def get(self, request: web.Request) -> web.Response:
+        hass: HomeAssistant = request.app["hass"]
+        if (resp := self._check_api_enabled(request)):
+            return resp
+        db_path = self._db_path
+        user = request.query.get("user", "").strip()
+        list_users = request.query.get("users", "").strip().lower() in ("true", "1")
+
+        def _list_users():
+            conn = sqlite3.connect(db_path)
+            try:
+                rows = conn.execute(
+                    f"SELECT DISTINCT user_name FROM {TABLE_MEDIA_PLAYLISTS} ORDER BY user_name"
+                ).fetchall()
+                return [{"user_name": r[0]} for r in rows]
+            finally:
+                conn.close()
+
+        import json as _json
+        def _list_playlists():
+            conn = sqlite3.connect(db_path)
+            try:
+                conn.row_factory = sqlite3.Row
+                if user:
+                    rows = conn.execute(
+                        f"SELECT * FROM {TABLE_MEDIA_PLAYLISTS} WHERE user_name = ? ORDER BY name",
+                        (user,),
+                    ).fetchall()
+                    playlist_count = len(rows)
+                else:
+                    rows = conn.execute(
+                        f"SELECT * FROM {TABLE_MEDIA_PLAYLISTS} ORDER BY user_name, name"
+                    ).fetchall()
+                    playlist_count = len(rows)
+                playlists = []
+                for r in rows:
+                    d = dict(r)
+                    if isinstance(d.get("songs"), str):
+                        try:
+                            d["songs"] = _json.loads(d["songs"])
+                        except _json.JSONDecodeError:
+                            d["songs"] = []
+                    playlists.append(d)
+                return {
+                    "playlists": playlists,
+                    "total": playlist_count,
+                }
+            finally:
+                conn.close()
+
+        try:
+            if list_users:
+                data = await self._exec_in_executor(hass, _list_users)
+                return self.json({"success": True, "data": data})
+            data = await self._exec_in_executor(hass, _list_playlists)
+            return self.json({"success": True, "data": data})
+        except Exception as exc:
+            return self.json({"success": False, "error": str(exc)}, status_code=500)
+
+    async def post(self, request: web.Request) -> web.Response:
+        hass: HomeAssistant = request.app["hass"]
+        if (resp := self._check_api_enabled(request)):
+            return resp
+        db_path = self._db_path
+        try:
+            body = await request.json()
+        except Exception:
+            return self.json({"success": False, "error": "请求体需为 JSON"}, status_code=400)
+
+        user_name = (body.get("user_name") or "").strip()
+        name = (body.get("name") or "").strip()
+        playlist_id = body.get("id")
+        songs = body.get("songs")
+
+        if not user_name:
+            return self.json({"success": False, "error": "user_name 必填"}, status_code=400)
+        if not name and not playlist_id:
+            return self.json({"success": False, "error": "name 或 id 必填"}, status_code=400)
+
+        now = __import__('datetime').datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        def _save():
+            conn = sqlite3.connect(db_path)
+            try:
+                if playlist_id:
+                    # 更新名称
+                    if songs is not None:
+                        songs_json = json.dumps(songs, ensure_ascii=False)
+                        conn.execute(
+                            f"UPDATE {TABLE_MEDIA_PLAYLISTS} SET name = ?, songs = ?, updated_at = ? WHERE id = ?",
+                            (name, songs_json, now, playlist_id),
+                        )
+                    else:
+                        conn.execute(
+                            f"UPDATE {TABLE_MEDIA_PLAYLISTS} SET name = ?, updated_at = ? WHERE id = ?",
+                            (name, now, playlist_id),
+                        )
+                else:
+                    songs_json = json.dumps(songs, ensure_ascii=False) if songs is not None else '[]'
+                    conn.execute(
+                        f"INSERT OR IGNORE INTO {TABLE_MEDIA_PLAYLISTS} (user_name, name, songs, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+                        (user_name, name, songs_json, now, now),
+                    )
+                conn.commit()
+                return {"success": True, "message": f"播放列表 '{name}' 已保存"}
+            except Exception as exc:
+                return {"success": False, "error": str(exc)}
+            finally:
+                conn.close()
+
+        result = await self._exec_in_executor(hass, _save)
+        return self.json(result)
+
+    async def delete(self, request: web.Request) -> web.Response:
+        hass: HomeAssistant = request.app["hass"]
+        if (resp := self._check_api_enabled(request)):
+            return resp
+        db_path = self._db_path
+        playlist_id = request.query.get("id", "").strip()
+        user_name = request.query.get("user", "").strip()
+
+        if not playlist_id and not user_name:
+            return self.json({"success": False, "error": "需要 id 或 user 参数"}, status_code=400)
+
+        def _delete():
+            conn = sqlite3.connect(db_path)
+            try:
+                if playlist_id:
+                    conn.execute(f"DELETE FROM {TABLE_MEDIA_PLAYLISTS} WHERE id = ?", (playlist_id,))
+                elif user_name:
+                    conn.execute(f"DELETE FROM {TABLE_MEDIA_PLAYLISTS} WHERE user_name = ?", (user_name,))
+                conn.commit()
+            finally:
+                conn.close()
+
+        try:
+            await self._exec_in_executor(hass, _delete)
+            msg = f"已删除用户 '{user_name}' 的全部播放列表" if user_name else f"播放列表已删除"
+            return self.json({"success": True, "message": msg})
+        except Exception as exc:
+            return self.json({"success": False, "error": str(exc)}, status_code=500)
+
+    async def put(self, request: web.Request) -> web.Response:
+        """更新播放列表的歌曲字段。
+        PUT /api/ha_data_store/media/playlists?id=xxx&key=xxx
+        Body: { "songs": [...] }
+        """
+        hass: HomeAssistant = request.app["hass"]
+        if (resp := self._check_api_enabled(request)):
+            return resp
+        db_path = self._db_path
+        playlist_id = request.query.get("id", "").strip()
+        if not playlist_id:
+            return self.json({"success": False, "error": "缺少 id 参数"}, status_code=400)
+        try:
+            body = await request.json()
+        except Exception:
+            return self.json({"success": False, "error": "请求体需为 JSON"}, status_code=400)
+        songs = body.get("songs")
+        if songs is None:
+            return self.json({"success": False, "error": "缺少 songs 字段"}, status_code=400)
+
+        now = __import__('datetime').datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        songs_json = json.dumps(songs, ensure_ascii=False)
+
+        def _update():
+            conn = sqlite3.connect(db_path)
+            try:
+                conn.execute(
+                    f"UPDATE {TABLE_MEDIA_PLAYLISTS} SET songs = ?, updated_at = ? WHERE id = ?",
+                    (songs_json, now, playlist_id),
+                )
+                conn.commit()
+                return {"success": True, "message": "歌曲已更新"}
+            finally:
+                conn.close()
+
+        try:
+            result = await self._exec_in_executor(hass, _update)
+            return self.json(result)
+        except Exception as exc:
+            return self.json({"success": False, "error": str(exc)}, status_code=500)
+
+
+# ===========================================================================
+#  媒体播放队列 API — 后端列表播放                                             #
+# ===========================================================================
+class MediaQueueView(_BaseDBView):
+    """管理后端列表播放队列。
+    GET    /api/ha_data_store/media/queue?entity_id=xxx&key=xxx        → 查询队列状态
+    POST   /api/ha_data_store/media/queue?key=xxx                      → 设置队列
+    DELETE /api/ha_data_store/media/queue?entity_id=xxx&key=xxx        → 停止队列
+    """
+
+    url = "/api/ha_data_store/media/queue"
+    name = "api:ha_data_store:media_queue"
+
+    async def get(self, request: web.Request) -> web.Response:
+        hass: HomeAssistant = request.app["hass"]
+        if (resp := self._check_api_enabled(request)):
+            return resp
+        entity_id = request.query.get("entity_id", "").strip()
+        if not entity_id:
+            return self.json({"success": False, "error": "缺少 entity_id 参数"}, status_code=400)
+
+        def _query():
+            conn = sqlite3.connect(self._db_path)
+            try:
+                conn.row_factory = sqlite3.Row
+                row = conn.execute(
+                    f"SELECT * FROM {TABLE_MEDIA_QUEUE} WHERE entity_id = ?",
+                    (entity_id,),
+                ).fetchone()
+                if not row:
+                    return None
+                d = dict(row)
+                if isinstance(d.get("tracks"), str):
+                    d["tracks"] = json.loads(d["tracks"])
+                return d
+            finally:
+                conn.close()
+
+        try:
+            data = await self._exec_in_executor(hass, _query)
+            return self.json({"success": True, "data": data})
+        except Exception as exc:
+            return self.json({"success": False, "error": str(exc)}, status_code=500)
+
+    async def post(self, request: web.Request) -> web.Response:
+        hass: HomeAssistant = request.app["hass"]
+        if (resp := self._check_api_enabled(request)):
+            return resp
+        try:
+            body = await request.json()
+        except Exception:
+            return self.json({"success": False, "error": "请求体需为 JSON"}, status_code=400)
+
+        entity_id = (body.get("entity_id") or "").strip()
+        tracks = body.get("tracks", [])
+        current_index = int(body.get("current_index", 0))
+        is_active = 1 if body.get("is_active", True) else 0
+
+        if not entity_id:
+            return self.json({"success": False, "error": "entity_id 必填"}, status_code=400)
+
+        now = __import__('datetime').datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        tracks_json = json.dumps(tracks, ensure_ascii=False)
+
+        def _save():
+            conn = sqlite3.connect(self._db_path)
+            try:
+                conn.execute(
+                    f"INSERT OR REPLACE INTO {TABLE_MEDIA_QUEUE} "
+                    f"(entity_id, tracks, current_index, is_active, created_at, updated_at) "
+                    f"VALUES (?, ?, ?, ?, ?, ?)",
+                    (entity_id, tracks_json, current_index, is_active, now, now),
+                )
+                conn.commit()
+                return {"success": True, "message": "队列已设置"}
+            finally:
+                conn.close()
+
+        try:
+            result = await self._exec_in_executor(hass, _save)
+            return self.json(result)
+        except Exception as exc:
+            return self.json({"success": False, "error": str(exc)}, status_code=500)
+
+    async def delete(self, request: web.Request) -> web.Response:
+        hass: HomeAssistant = request.app["hass"]
+        if (resp := self._check_api_enabled(request)):
+            return resp
+        entity_id = request.query.get("entity_id", "").strip()
+        if not entity_id:
+            return self.json({"success": False, "error": "缺少 entity_id 参数"}, status_code=400)
+
+        def _stop():
+            conn = sqlite3.connect(self._db_path)
+            try:
+                conn.execute(
+                    f"UPDATE {TABLE_MEDIA_QUEUE} SET is_active = 0, updated_at = ? WHERE entity_id = ?",
+                    (__import__('datetime').datetime.now().strftime("%Y-%m-%d %H:%M:%S"), entity_id),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+        try:
+            await self._exec_in_executor(hass, _stop)
+            return self.json({"success": True, "message": "队列已停止"})
         except Exception as exc:
             return self.json({"success": False, "error": str(exc)}, status_code=500)
 

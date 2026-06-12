@@ -277,6 +277,7 @@
     <button class="sub-tab-btn" onclick="switchSubTab('vacuum')">🧹 扫地机器人</button>
     <button class="sub-tab-btn" onclick="switchSubTab('bridge')">🌉 设备桥接</button>
     <button class="sub-tab-btn" onclick="switchSubTab('virtual')">🔮 虚拟设备</button>
+    <button class="sub-tab-btn" onclick="switchSubTab('media')">🎵 媒体播放列表</button>
   </div>
 
   <!-- 子面板: 设备类 -->
@@ -733,6 +734,8 @@
             <option value="number">数值 (number)</option>
             <option value="select">选择器 (select)</option>
             <option value="vacuum">扫地机器人 (vacuum)</option>
+            <option value="media">🎬 媒体虚拟设备 (media_player)</option>
+            <option value="speaker">🔊 音响虚拟设备 (media_player)</option>
           </select>
         </div>
         <div>
@@ -752,6 +755,39 @@
       <div class="form-actions" style="margin-top:12px">
         <button class="btn-green" onclick="createVirtualDevice()">✨ 立即创建</button>
         <span class="hint" style="margin-left:10px" id="vdHint">创建后无需重启 HA，立即可用</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- 子面板: 媒体播放列表 -->
+  <div id="sub-media" class="sub-panel">
+    <div id="mediaUserList"></div>
+
+    <div class="section">
+      <h3>🎵 管理用户</h3>
+      <div class="hint">每个用户可拥有多个播放列表，由前端卡片展示和管理歌曲内容。</div>
+      <div class="form-grid" style="grid-template-columns:1fr auto">
+        <div>
+          <label>用户名称</label>
+          <input type="text" id="mediaUserName" placeholder="如：张三" style="width:100%">
+        </div>
+        <div style="display:flex;align-items:flex-end;gap:6px">
+          <button class="btn-green" onclick="addMediaUser()">➕ 添加用户</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="section" id="mediaPlaylistSection" style="display:none">
+      <h3>📋 <span id="mediaCurrentUser"></span> 的播放列表</h3>
+      <div id="mediaPlaylistContent"></div>
+      <div class="form-grid" style="grid-template-columns:1fr auto;margin-top:12px">
+        <div>
+          <label>播放列表名称</label>
+          <input type="text" id="mediaPlaylistName" placeholder="如：我的歌单" style="width:100%">
+        </div>
+        <div style="display:flex;align-items:flex-end;gap:6px">
+          <button class="btn-green" onclick="addMediaPlaylist()">➕ 添加播放列表</button>
+        </div>
       </div>
     </div>
   </div>
@@ -861,6 +897,7 @@
         </optgroup>
         <optgroup label="属性提取">
           <option value="attr_history">属性历史</option>
+          <option value="attr_daily">📅 属性按日分组</option>
           <option value="attr_latest">属性最新</option>
         </optgroup>
         <optgroup label="按日汇总">
@@ -895,6 +932,13 @@
         <button type="button" onclick="toggleApiTableCbs()" style="font-size:11px;padding:2px 8px;border-radius:4px">全选</button>
       </div>
       <div id="apiTableCbs" style="display:flex;gap:10px;flex-wrap:wrap;padding-top:4px;max-height:100px;overflow-y:auto"></div>
+    </div>
+    <!-- 属性按日分组专用：单选下拉 -->
+    <div id="apiAttrDailyRow" style="display:none">
+      <label>属性类型（单选）</label>
+      <select id="apiAttrDailyType" onchange="onAttrDailyTypeChange()" style="width:100%">
+        <option value="">-- 请选择 --</option>
+      </select>
     </div>
     <div id="apiCategoryRow" style="display:none">
       <label>数据类别</label>
@@ -954,7 +998,7 @@
     </div>
     <div id="apiDateFieldRow" style="display:none">
       <label>日期字段</label>
-      <select id="apiDateField" onchange="generateApiUrl()">
+      <select id="apiDateField" onchange="generateApiUrl()" style="width:100%">
         <option value="">-- 自动检测 --</option>
         <option value="on_time">on_time（设备类）</option>
         <option value="datetime">datetime（环境/属性类）</option>
@@ -1226,7 +1270,8 @@ const FILTER_OPS = [
 function isUserTable(name) {
   if (name === 'attr_type_defs') return false;
   return name.startsWith('attr_') || name === 'device_history' || name.startsWith('env_')
-      || name === 'health_records';
+      || name === 'health_records'
+      || name === 'media_playlists' || name === 'media_queue';
 }
 
 function populateTableSelect() {
@@ -3840,7 +3885,8 @@ function onVdTypeChange() {
   // 自动填充实体 ID 前缀
   var eidInput = document.getElementById('vdEntityId');
   if (!eidInput.value || eidInput.value.endsWith('.')) {
-    eidInput.value = t + '.';
+    var prefix = (t === 'media' || t === 'speaker') ? 'media_player' : t;
+    eidInput.value = prefix + '.';
   }
   if (t === 'sensor') {
     div.style.display = 'block';
@@ -3962,6 +4008,114 @@ async function createVirtualDevice() {
   }
 }
 
+// ==============================
+//  媒体播放列表管理
+// ==============================
+const MEDIA_API = '/api/ha_data_store/media/playlists';
+var _currentMediaUser = '';
+
+async function loadMediaUsers() {
+  var div = document.getElementById('mediaUserList');
+  try {
+    var resp = await fetch(MEDIA_API + '?users=true');
+    var json = await resp.json();
+    var users = json.data || [];
+    if (!users.length) {
+      div.innerHTML = '<div class="hint">暂无用户，请添加。</div>';
+      document.getElementById('mediaPlaylistSection').style.display = 'none';
+      return;
+    }
+    var html = '<h4>已有用户 (' + users.length + '个)</h4><div class="table-wrap"><table><thead><tr>' +
+      '<th>用户</th><th style="width:120px">操作</th></tr></thead><tbody>';
+    users.forEach(function(u) {
+      html += '<tr><td><a href="#" onclick="selectMediaUser(\'' + escAttr(u.user_name) + '\');return false">' + escHtml(u.user_name) + '</a></td>' +
+        '<td><button class="btn-del" onclick="delMediaUser(\'' + escAttr(u.user_name) + '\')">删除</button></td></tr>';
+    });
+    html += '</tbody></table></div>';
+    div.innerHTML = html;
+  } catch(e) { div.innerHTML = '<div class="hint">加载失败</div>'; }
+}
+
+async function selectMediaUser(userName) {
+  _currentMediaUser = userName;
+  document.getElementById('mediaCurrentUser').textContent = userName;
+  document.getElementById('mediaPlaylistSection').style.display = '';
+  await loadMediaPlaylists(userName);
+}
+
+async function loadMediaPlaylists(userName) {
+  var div = document.getElementById('mediaPlaylistContent');
+  try {
+    var resp = await fetch(MEDIA_API + '?user=' + encodeURIComponent(userName));
+    var json = await resp.json();
+    var data = json.data || {};
+    var playlists = data.playlists || [];
+    if (!playlists.length) { div.innerHTML = '<div class="hint">暂无播放列表</div>'; return; }
+    var html = '<div class="table-wrap"><table><thead><tr>' +
+      '<th>ID</th><th>播放列表名称</th><th>创建时间</th><th>更新时间</th><th style="width:60px">操作</th></tr></thead><tbody>';
+    playlists.forEach(function(p) {
+      html += '<tr><td>' + p.id + '</td><td>' + escHtml(p.name) + '</td><td>' + escHtml(p.created_at) +
+        '</td><td>' + escHtml(p.updated_at) + '</td><td><button class="btn-del" onclick="delMediaPlaylist(' + p.id + ')">删除</button></td></tr>';
+    });
+    html += '</tbody></table></div>';
+    div.innerHTML = html;
+  } catch(e) { div.innerHTML = '<div class="hint">加载失败</div>'; }
+}
+
+async function addMediaUser() {
+  var name = document.getElementById('mediaUserName').value.trim();
+  if (!name) { showToast('请输入用户名称', false); return; }
+  try {
+    var resp = await fetch(MEDIA_API, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({user_name: name, name: name + '的默认播放列表'}),
+    });
+    var json = await resp.json();
+    showToast(json.message || '已添加', json.success);
+    if (json.success) { document.getElementById('mediaUserName').value = ''; loadMediaUsers(); }
+  } catch(e) { showToast('请求失败', false); }
+}
+
+async function delMediaUser(userName) {
+  if (!confirm('确定删除用户 ' + userName + ' 及其所有播放列表？')) return;
+  try {
+    var resp = await fetch(MEDIA_API + '?user=' + encodeURIComponent(userName), { method: 'DELETE' });
+    var json = await resp.json();
+    showToast(json.message || '已删除', json.success);
+    if (json.success) {
+      if (_currentMediaUser === userName) { _currentMediaUser = ''; document.getElementById('mediaPlaylistSection').style.display = 'none'; }
+      loadMediaUsers();
+    }
+  } catch(e) { showToast('请求失败', false); }
+}
+
+async function addMediaPlaylist() {
+  if (!_currentMediaUser) { showToast('请先选择用户', false); return; }
+  var name = document.getElementById('mediaPlaylistName').value.trim();
+  if (!name) { showToast('请输入播放列表名称', false); return; }
+  try {
+    var resp = await fetch(MEDIA_API, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({user_name: _currentMediaUser, name: name}),
+    });
+    var json = await resp.json();
+    showToast(json.message || '已添加', json.success);
+    if (json.success) { document.getElementById('mediaPlaylistName').value = ''; loadMediaPlaylists(_currentMediaUser); }
+  } catch(e) { showToast('请求失败', false); }
+}
+
+async function delMediaPlaylist(id) {
+  if (!confirm('确定删除该播放列表？')) return;
+  try {
+    var resp = await fetch(MEDIA_API + '?id=' + id, { method: 'DELETE' });
+    var json = await resp.json();
+    showToast(json.message || '已删除', json.success);
+    if (json.success) loadMediaPlaylists(_currentMediaUser);
+  } catch(e) { showToast('请求失败', false); }
+}
+
 // =========================================================================
 const BASE_PATH = window.location.origin;
 const BASE_URL = '/api/ha_data_store/query';
@@ -4004,10 +4158,13 @@ function populateApiTableCbs(items) {
     label.style.cssText = 'font-size:13px;display:flex;align-items:center;gap:4px;cursor:pointer';
     const cb = document.createElement('input');
     cb.type = 'checkbox';
-    cb.value = v;
+    // 支持 {value, label} 对象格式，也兼容简单字符串
+    const val = (typeof v === 'object') ? v.value : v;
+    const txt = (typeof v === 'object') ? v.label : v;
+    cb.value = val;
     cb.onchange = generateApiUrl;
     label.appendChild(cb);
-    label.appendChild(document.createTextNode(v));
+    label.appendChild(document.createTextNode(txt));
     container.appendChild(label);
   });
 }
@@ -4039,6 +4196,7 @@ function onApiTypeChange() {
   const isHealthHistory = qt === 'health_history';
   const isHealthLatest = qt === 'health_latest';
   const isHealth = isHealthHistory || isHealthLatest;
+  const isAttrDaily = qt === 'attr_daily';
 
   // 电费专属字段：默认隐藏，仅 electricity_standard 时显示
   document.getElementById('apiEleDayTableRow').style.display = isElectricityStandard ? '' : 'none';
@@ -4055,8 +4213,13 @@ function onApiTypeChange() {
   document.getElementById('apiMonthRow').style.display = (isEntityDataDates || isAggregateDaily) ? 'block' : 'none';
   // 年份行：aggregate_monthly 时显示
   document.getElementById('apiYearRow').style.display = isAggregateMonthly ? 'block' : 'none';
-  // 日期字段行：entity_data_dates 或聚合查询时显示
-  document.getElementById('apiDateFieldRow').style.display = (isEntityDataDates || isAggregate) ? 'block' : 'none';
+  // 日期字段行：entity_data_dates 或聚合查询时显示（恢复为下拉选择）
+  if (isEntityDataDates || isAggregate) {
+    document.getElementById('apiDateFieldRow').style.display = 'block';
+    restoreDateFieldSelect();
+  } else {
+    document.getElementById('apiDateFieldRow').style.display = 'none';
+  }
 
   if (isVacuumHistory) {
     document.getElementById('apiEntityId').parentNode.style.display = '';
@@ -4192,6 +4355,27 @@ function onApiTypeChange() {
       onDateModeChange();
     }
     loadHealthTypes();
+  } else if (isAttrDaily) {
+    document.getElementById('apiEntityId').parentNode.style.display = '';
+    document.getElementById('apiRoom').parentNode.style.display = 'none';
+    document.getElementById('apiTableRow').style.display = 'none';
+    document.getElementById('apiAttrDailyRow').style.display = '';
+    document.getElementById('apiLimit').parentNode.style.display = 'none';
+    document.getElementById('apiOffset').parentNode.style.display = 'none';
+    document.getElementById('apiOrderBy').parentNode.style.display = 'none';
+    document.getElementById('apiFields').parentNode.style.display = 'none';
+    document.getElementById('apiDateMode').parentNode.style.display = 'none';
+    document.getElementById('apiDateSingle').style.display = 'none';
+    document.getElementById('apiDateRange').style.display = 'none';
+    document.getElementById('apiMonthRow').style.display = '';
+    document.getElementById('apiYearRow').style.display = 'none';
+    document.getElementById('apiDateFieldRow').style.display = '';
+    document.getElementById('apiCategoryRow').style.display = 'none';
+    document.getElementById('apiMetricsRow').style.display = 'none';
+    // attr_daily 下日期字段改为文本输入框
+    switchDateFieldToInput();
+    loadApiEntitiesAndRooms();
+    loadAttrDailyTypes();
   } else {
     document.getElementById('apiEntityId').parentNode.style.display = '';
     document.getElementById('apiRoom').parentNode.style.display = '';
@@ -4202,6 +4386,7 @@ function onApiTypeChange() {
     document.getElementById('apiFields').parentNode.style.display = '';
     document.getElementById('apiDateMode').parentNode.style.display = '';
     document.getElementById('apiDateMode').value = 'none';
+    restoreDateFieldSelect();
     onDateModeChange();
   }
 
@@ -4232,13 +4417,60 @@ function onDateModeChange() {
   generateApiUrl();
 }
 
+// ==============================
+//  日期字段控件切换（attr_daily用文本输入，其他用下拉）
+// ==============================
+var _savedDateFieldSelect = null; // 保存下拉的HTML，用于恢复
+
+function switchDateFieldToInput() {
+  var container = document.getElementById('apiDateFieldRow');
+  var select = document.getElementById('apiDateField');
+  if (!select || select.tagName !== 'SELECT') return;
+  _savedDateFieldSelect = select.outerHTML;
+  var input = document.createElement('input');
+  input.type = 'text';
+  input.id = 'apiDateField';
+  input.placeholder = 'datetime';
+  input.style.width = '100%';
+  input.oninput = generateApiUrl;
+  select.parentNode.replaceChild(input, select);
+}
+
+function restoreDateFieldSelect() {
+  var el = document.getElementById('apiDateField');
+  if (!el || el.tagName === 'SELECT') return;
+  if (_savedDateFieldSelect) {
+    el.outerHTML = _savedDateFieldSelect;
+    _savedDateFieldSelect = null;
+  }
+}
+
 async function loadAttrTypesForApi() {
   try {
     const resp = await fetch('/api/ha_data_store/attr_types');
     const json = await resp.json();
-    const names = (json.data||[]).map(t => t.type_name);
+    const names = (json.data||[]).map(t => ({value: t.type_name, label: 'attr_' + t.type_name}));
     populateApiTableCbs(names);
   } catch(e) {}
+}
+
+// 属性按日分组：加载属性类型下拉（单选）
+async function loadAttrDailyTypes() {
+  const sel = document.getElementById('apiAttrDailyType');
+  sel.innerHTML = '<option value="">-- 请选择 --</option>';
+  try {
+    const resp = await fetch('/api/ha_data_store/attr_types');
+    const json = await resp.json();
+    (json.data||[]).forEach(t => {
+      const v = t.type_name;
+      sel.innerHTML += '<option value="' + escAttr(v) + '">attr_' + escHtml(v) + '</option>';
+    });
+  } catch(e) {}
+}
+
+// 属性按日分组：选中类型后刷新URL（日期字段由用户手动输入）
+async function onAttrDailyTypeChange() {
+  generateApiUrl();
 }
 
 async function loadVacuumIdsForApi() {
@@ -4432,6 +4664,19 @@ function generateApiUrl() {
       // 非默认值才传递，保持向后兼容
       url += '&translated_field=' + encodeURIComponent(translatedField);
     }
+    document.getElementById('apiUrlOutput').value = url;
+    return;
+  }
+
+  // attr_daily 模式特殊处理（仅单表）
+  if (qt === 'attr_daily') {
+    const attrType = document.getElementById('apiAttrDailyType').value;
+    if (attrType) url += '&attr_type=' + encodeURIComponent(attrType);
+    if (entityId) url += '&entity_id=' + encodeURIComponent(entityId);
+    const month = document.getElementById('apiMonth').value;
+    if (month) url += '&month=' + encodeURIComponent(month);
+    const dateField = document.getElementById('apiDateField').value;
+    if (dateField) url += '&date_field=' + encodeURIComponent(dateField);
     document.getElementById('apiUrlOutput').value = url;
     return;
   }
